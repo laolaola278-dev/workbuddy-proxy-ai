@@ -1,0 +1,16 @@
+{
+  "name": "workbuddy-cline-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Cline-facing OpenAI/Anthropic compatibility proxy for the WorkBuddy model catalog",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
