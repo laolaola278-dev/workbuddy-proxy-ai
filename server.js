@@ -45,7 +45,7 @@ const WORKBUDDY_EDITION = String(process.env.WORKBUDDY_EDITION || 'international
 const EDITION = EDITIONS[WORKBUDDY_EDITION] || EDITIONS.international;
 const BUILTIN_CLI = String(process.env.WORKBUDDY_CLI_PATH || '').trim();
 const BUILTIN_CONFIG_DIR = String(process.env.WORKBUDDY_CONFIG_DIR || path.join(process.env.USERPROFILE || '', EDITION.configDir)).trim();
-const BUILTIN_MODELS = new Set(csv(process.env.WORKBUDDY_BUILTIN_MODELS || EDITION.models).map((item) => item.toLowerCase()));
+const BUILTIN_MODELS = new Set(csv(process.env.WORKBUDDY_BUILTIN_MODELS ?? EDITION.models).map((item) => item.toLowerCase()));
 const BUILTIN_HOST_PORT = Number(process.env.WORKBUDDY_HOST_PORT || 60123);
 const BUILTIN_TIMEOUT_MS = Number(process.env.WORKBUDDY_BUILTIN_TIMEOUT_MS || 180000);
 
@@ -490,6 +490,16 @@ function flattenOpenAiMessages(messages) {
   }).filter(Boolean).join('\n\n');
 }
 
+function hostedHeaders(sessionToken, connectionId, data) {
+  return {
+    'content-type': 'application/json',
+    accept: 'application/json, text/event-stream',
+    'content-length': Buffer.byteLength(data),
+    ...(sessionToken ? { 'acp-session-token': sessionToken } : {}),
+    ...(connectionId ? { 'acp-connection-id': connectionId } : {}),
+  };
+}
+
 function hostedRequest(port, sessionToken, connectionId, method, requestPath, body) {
   const data = body ? JSON.stringify(body) : '';
   return new Promise((resolve, reject) => {
@@ -498,15 +508,8 @@ function hostedRequest(port, sessionToken, connectionId, method, requestPath, bo
       port,
       path: requestPath,
       method,
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json, text/event-stream',
-        'content-length': Buffer.byteLength(data),
-        connection: 'close',
-        ...(sessionToken ? { 'acp-session-token': sessionToken } : {}),
-        ...(connectionId ? { 'acp-connection-id': connectionId } : {}),
-      },
-      timeout: 30000,
+      headers: hostedHeaders(sessionToken, connectionId, data),
+      timeout: requestPath.endsWith('/acp') ? BUILTIN_TIMEOUT_MS : 30000,
     }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
@@ -525,53 +528,128 @@ function hostedRequest(port, sessionToken, connectionId, method, requestPath, bo
   });
 }
 
-function acpText(payload) {
-  return [...String(payload || '').matchAll(/"text":"((?:\\.|[^"\\])*)"/g)]
-    .map((match) => JSON.parse(`"${match[1]}"`))
-    .filter(Boolean);
+function hostedRequestStream(port, sessionToken, connectionId, method, requestPath, body, onDelta) {
+  const data = body ? JSON.stringify(body) : '';
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: requestPath,
+      method,
+      headers: hostedHeaders(sessionToken, connectionId, data),
+      timeout: requestPath.endsWith('/acp') ? BUILTIN_TIMEOUT_MS : 30000,
+    }, (res) => {
+      const chunks = [];
+      let pending = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        chunks.push(chunk);
+        pending += chunk;
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() || '';
+        for (const line of lines) {
+          const delta = acpDeltaFromLine(line);
+          if (delta) onDelta(delta);
+        }
+      });
+      res.on('end', () => {
+        if (pending) {
+          const delta = acpDeltaFromLine(pending);
+          if (delta) onDelta(delta);
+        }
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          text: chunks.join(''),
+        });
+      });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      reject(httpError(504, 'upstream_timeout', 'WorkBuddy built-in model timed out.'));
+    });
+    req.on('error', (error) => reject(httpError(502, 'upstream_unreachable', `WorkBuddy hosted CLI is not reachable: ${error.message}`)));
+    req.end(data);
+  });
 }
 
-function runBuiltinModel(modelId, prompt) {
+function hostedSession(port, sessionToken, connectionId, model, prompt, onDelta) {
+  function post(id, method, params, streamDelta) {
+    const payload = { jsonrpc: '2.0', id, method, params };
+    if (streamDelta) return hostedRequestStream(port, sessionToken, connectionId, 'POST', '/api/v1/acp', payload, streamDelta);
+    return hostedRequest(port, sessionToken, connectionId, 'POST', '/api/v1/acp', payload);
+  }
+  return (async () => {
+    const [initialized, created] = await Promise.all([
+      post(1, 'initialize', { protocolVersion: 1, clientInfo: { name: 'workbuddy-proxy', version: '1' } }),
+      post(2, 'session/new', { cwd: process.cwd(), model, mcpServers: [] }),
+    ]);
+    if (initialized.status !== 200) throw httpError(502, 'upstream_error', 'WorkBuddy hosted CLI rejected initialization.');
+    const sessionId = (created.text.match(/"sessionId":"([^"]+)"/) || [])[1];
+    if (!sessionId) throw httpError(502, 'upstream_error', 'WorkBuddy hosted CLI did not create a session.');
+    return post(3, 'session/prompt', {
+      sessionId,
+      prompt: [{ type: 'text', text: prompt }],
+      model,
+      maxTurns: 1,
+    }, onDelta);
+  })();
+}
+function acpDeltaFromLine(line) {
+  const trimmed = String(line || '').trim();
+  if (!trimmed.startsWith('data:')) return null;
+  const raw = trimmed.slice(5).trim();
+  if (!raw || raw === '[DONE]') return null;
+  let event;
+  try { event = JSON.parse(raw); } catch { return null; }
+  const update = event?.params?.update;
+  const text = update?.content?.text;
+  if (typeof text !== 'string' || text.length === 0) return null;
+  if (update.sessionUpdate === 'agent_message_chunk') return { kind: 'text', text };
+  if (update.sessionUpdate === 'agent_thought_chunk') return { kind: 'reasoning', text };
+  return null;
+}
+
+function acpText(payload) {
+  const chunks = [];
+  for (const line of String(payload || '').split(/\r?\n/)) {
+    const delta = acpDeltaFromLine(line);
+    if (delta?.kind === 'text') chunks.push(delta.text);
+  }
+  if (chunks.length > 0) return chunks.join('');
+  return [...String(payload || '').matchAll(/"text":"((?:\\.|[^"\\])*)"/g)]
+    .map((match) => JSON.parse(`"${match[1]}"`))
+    .filter(Boolean)
+    .join('');
+}
+
+function runBuiltinModel(modelId, prompt, onDelta) {
   const model = stripNamespacePrefix(modelId);
   return (async () => {
-    const opened = await hostedRequest(BUILTIN_HOST_PORT, '', '', 'GET', '/api/v1/acp');
-    const sessionToken = opened.headers['acp-session-token'];
+    const opened = await new Promise((resolve, reject) => {
+      const child = spawn('curl.exe', ['-s', '-m', '8', '-D', '-', '-o', 'NUL', `http://127.0.0.1:${BUILTIN_HOST_PORT}/api/v1/acp`], { windowsHide: true });
+      const chunks = [];
+      const timer = setTimeout(() => { child.kill(); reject(httpError(504, 'upstream_timeout', 'WorkBuddy built-in model timed out.')); }, 10000);
+      child.stdout.on('data', (chunk) => chunks.push(chunk));
+      child.on('error', (error) => { clearTimeout(timer); reject(httpError(502, 'upstream_unreachable', error.message)); });
+      child.on('close', () => { clearTimeout(timer); resolve(Buffer.concat(chunks).toString('utf8')); });
+    });
+    const sessionToken = (opened.match(/acp-session-token:\s*(\S+)/i) || [])[1];
     if (!sessionToken) throw httpError(503, 'builtin_host_unavailable', 'WorkBuddy hosted CLI is not accepting local sessions.');
     const connected = await hostedRequest(BUILTIN_HOST_PORT, sessionToken, 'proxy', 'POST', '/api/v1/acp/connect', {});
     const connection = JSON.parse(connected.text);
     if (!connection.connectionId || !connection.sessionToken) throw httpError(502, 'upstream_error', 'WorkBuddy hosted CLI did not open a connection.');
-    const initialized = await hostedRequest(BUILTIN_HOST_PORT, connection.sessionToken, connection.connectionId, 'POST', '/api/v1/acp', {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: { protocolVersion: 1, clientInfo: { name: 'workbuddy-proxy', version: '1' } },
-    });
-    if (initialized.status !== 200) throw httpError(502, 'upstream_error', 'WorkBuddy hosted CLI rejected initialization.');
-    const created = await hostedRequest(BUILTIN_HOST_PORT, connection.sessionToken, connection.connectionId, 'POST', '/api/v1/acp', {
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'session/new',
-      params: { cwd: process.cwd(), model, mcpServers: [] },
-    });
-    const sessionMatch = created.text.match(/"sessionId":"([^"]+)"/);
-    if (!sessionMatch) throw httpError(502, 'upstream_error', 'WorkBuddy hosted CLI did not create a session.');
-    const prompted = await hostedRequest(BUILTIN_HOST_PORT, connection.sessionToken, connection.connectionId, 'POST', '/api/v1/acp', {
-      jsonrpc: '2.0',
-      id: 3,
-      method: 'session/prompt',
-      params: {
-        sessionId: sessionMatch[1],
-        prompt: [{ type: 'text', text: prompt }],
-        model,
-        maxTurns: 1,
-      },
+    let messageText = '';
+    const prompted = await hostedSession(BUILTIN_HOST_PORT, connection.sessionToken, connection.connectionId, model, prompt, (delta) => {
+      if (delta.kind === 'text') messageText += delta.text;
+      if (onDelta) onDelta(delta);
     });
     if (prompted.text.includes('"error"')) {
-      const message = acpText(prompted.text).at(-1) || 'WorkBuddy hosted CLI returned an error.';
+      const message = acpText(prompted.text) || 'WorkBuddy hosted CLI returned an error.';
       throw httpError(502, 'upstream_error', message);
     }
-    const text = acpText(prompted.text).at(-1) || '';
-    if (!text) throw httpError(502, 'upstream_error', 'WorkBuddy hosted CLI returned no text.');
+    const text = messageText || acpText(prompted.text);
+    if (!text) throw httpError(502, 'upstream_error', `status=${prompted.status} headers=${JSON.stringify(prompted.headers)} body=${JSON.stringify(prompted.text.slice(0, 120))}`);
     return text;
   })();
 }
@@ -887,25 +965,60 @@ async function forwardUpstreamError(upstream, res) {
   res.end(bytes);
 }
 
+function writeOpenAiChunk(res, id, created, model, delta, finishReason) {
+  res.write(`data: ${JSON.stringify({
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`);
+}
+
 async function handleBuiltinChat(body, res, requestedModel) {
   const prompt = flattenOpenAiMessages(body.messages);
   if (!prompt) throw httpError(400, 'invalid_messages', 'messages must contain text.');
-  const text = await runBuiltinModel(requestedModel, prompt);
-  const payload = {
-    id: `chatcmpl-hy3-${Date.now()}`,
-    object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000),
-    model: requestedModel,
-    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-  };
-  if (body.stream) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' });
-    res.write(`data: ${JSON.stringify({ id: payload.id, object: 'chat.completion.chunk', created: payload.created, model: requestedModel, choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }] })}\n\n`);
-    res.write(`data: ${JSON.stringify({ id: payload.id, object: 'chat.completion.chunk', created: payload.created, model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
-    res.end('data: [DONE]\n\n');
+  const id = `chatcmpl-hy3-${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+  if (!body.stream) {
+    const text = await runBuiltinModel(requestedModel, prompt);
+    sendJson(res, 200, {
+      id,
+      object: 'chat.completion',
+      created,
+      model: requestedModel,
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+    });
     return;
   }
-  sendJson(res, 200, payload);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.socket?.setNoDelay(true);
+  writeOpenAiChunk(res, id, created, requestedModel, { role: 'assistant' }, null);
+  let messageText = '';
+  try {
+    const text = await runBuiltinModel(requestedModel, prompt, (delta) => {
+      if (delta.kind === 'reasoning') {
+        writeOpenAiChunk(res, id, created, requestedModel, { reasoning_content: delta.text }, null);
+        return;
+      }
+      messageText += delta.text;
+      writeOpenAiChunk(res, id, created, requestedModel, { content: delta.text }, null);
+    });
+    if (!messageText && text) writeOpenAiChunk(res, id, created, requestedModel, { content: text }, null);
+    writeOpenAiChunk(res, id, created, requestedModel, {}, 'stop');
+    res.end('data: [DONE]\n\n');
+  } catch (error) {
+    console.error(`[workbuddy-proxy] builtin stream failed: ${error.message}`);
+    if (!res.writableEnded) {
+      writeOpenAiChunk(res, id, created, requestedModel, {}, 'stop');
+      res.end('data: [DONE]\n\n');
+    }
+  }
 }
 
 async function handleOpenAiChat(body, res, req) {
@@ -1264,6 +1377,7 @@ module.exports = {
   prepareOpenAiImageRequest,
   prepareOpenAiRequest,
   stripNamespacePrefix,
+  acpDeltaFromLine,
 };
 
 

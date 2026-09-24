@@ -60,11 +60,9 @@ async function stopServer(server) {
 
 async function startProxy(upstreamPort, protocol, options = {}) {
   const port = await reservePort();
-  const child = spawn(process.execPath, ['server.js'], {
-    cwd: PROXY_DIR,
-    env: {
-      ...process.env,
-      HOST: '127.0.0.1',
+  const env = {
+    ...process.env,
+    HOST: '127.0.0.1',
       PORT: String(port),
       UPSTREAM_BASE_URL: `http://127.0.0.1:${upstreamPort}/v1`,
       UPSTREAM_API_KEY: 'upstream-test-key',
@@ -83,7 +81,12 @@ async function startProxy(upstreamPort, protocol, options = {}) {
       REQUEST_TIMEOUT_MS: String(options.timeoutMs ?? 5000),
       STREAM_IDLE_TIMEOUT_MS: String(options.streamIdleTimeoutMs ?? options.timeoutMs ?? 5000),
       MODEL_CATALOG_PATH: './models.json',
-    },
+  };
+  if (options.builtinModels === undefined) env.WORKBUDDY_BUILTIN_MODELS = '';
+  else env.WORKBUDDY_BUILTIN_MODELS = options.builtinModels;
+  const child = spawn(process.execPath, ['server.js'], {
+    cwd: PROXY_DIR,
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 

@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { anthropicToOpenAi, buildUpstreamUrl, openAiToAnthropic, CATALOG, DEFAULT_MODEL, loadModelRoutes, prepareOpenAiImageRequest, prepareOpenAiRequest, stripNamespacePrefix, upstreamModelId } = require('../server');
+const { anthropicToOpenAi, buildUpstreamUrl, openAiToAnthropic, CATALOG, DEFAULT_MODEL, loadModelRoutes, prepareOpenAiImageRequest, prepareOpenAiRequest, stripNamespacePrefix, upstreamModelId, acpDeltaFromLine } = require('../server');
 
 test('loads the WorkBuddy model catalog', () => {
   assert.equal(CATALOG.length, 44);
@@ -212,4 +212,17 @@ test('loads only complete entries from a WorkBuddy models.json route file', () =
 test('strips WorkBuddy routing namespaces before upstream mapping', () => {
   assert.equal(stripNamespacePrefix('custom-local:org/gpt-5'), 'gpt-5');
   assert.equal(upstreamModelId('custom-local:org/gpt-5'), 'gpt-5');
+});
+
+test('turns ACP message and thought lines into stream deltas', () => {
+  assert.deepEqual(acpDeltaFromLine('data: {"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"hi"}}}}'), {
+    kind: 'text',
+    text: 'hi',
+  });
+  assert.deepEqual(acpDeltaFromLine('data: {"params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"plan"}}}}'), {
+    kind: 'reasoning',
+    text: 'plan',
+  });
+  assert.equal(acpDeltaFromLine('data: [DONE]'), null);
+  assert.equal(acpDeltaFromLine('event: ping'), null);
 });
