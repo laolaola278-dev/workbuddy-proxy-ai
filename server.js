@@ -41,7 +41,7 @@ const EDITIONS = {
     configDir: '.workbuddy-ai',
   },
 };
-const WORKBUDDY_EDITION = String(process.env.WORKBUDDY_EDITION || 'domestic').trim().toLowerCase();
+const WORKBUDDY_EDITION = String(process.env.WORKBUDDY_EDITION || 'international').trim().toLowerCase();
 const EDITION = EDITIONS[WORKBUDDY_EDITION] || EDITIONS.international;
 const BUILTIN_CLI = String(process.env.WORKBUDDY_CLI_PATH || '').trim();
 const BUILTIN_CONFIG_DIR = String(process.env.WORKBUDDY_CONFIG_DIR || path.join(process.env.USERPROFILE || '', EDITION.configDir)).trim();
